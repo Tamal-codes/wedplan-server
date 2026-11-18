@@ -30,18 +30,39 @@ async function run() {
 
     const servicesCollection = db.collection("services");
 
+   
     app.get("/services", async (req, res) => {
       try {
+        const { search, category, location, sort } = req.query;
+
+        const query = { status: "approved" };
+
+        if (search) {
+          query.serviceName = { $regex: search, $options: "i" };
+        }
+        if (category) {
+          query.category = category;
+        }
+        if (location) {
+          query.location = { $regex: location, $options: "i" };
+        }
+
+        let sortOption = {};
+        if (sort === "price_asc") sortOption = { price: 1 };
+        if (sort === "price_desc") sortOption = { price: -1 };
+
         const services = await servicesCollection
-          .find({ status: "approved" })
+          .find(query)
+          .sort(sortOption)
           .toArray();
+
         res.json(services);
       } catch (error) {
         res.status(500).json({ message: "Failed to fetch services" });
       }
     });
 
-    // একটা সার্ভিসের ডিটেইলস (পাবলিক)
+   
     app.get("/services/:id", async (req, res) => {
       try {
         const { id } = req.params;
