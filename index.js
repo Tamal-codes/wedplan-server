@@ -28,10 +28,31 @@ async function run() {
     const db = client.db(process.env.DB_NAME);
     console.log("MongoDB connected");
 
-   
+    const servicesCollection = db.collection("services");
 
-    app.get("/", (req, res) => {
-      res.send("WedPlan server is running");
+    app.get("/services", async (req, res) => {
+      try {
+        const services = await servicesCollection
+          .find({ status: "approved" })
+          .toArray();
+        res.json(services);
+      } catch (error) {
+        res.status(500).json({ message: "Failed to fetch services" });
+      }
+    });
+
+    app.post("/services", async (req, res) => {
+      try {
+        const service = {
+          ...req.body,
+          status: "pending",
+          createdAt: new Date(),
+        };
+        const result = await servicesCollection.insertOne(service);
+        res.status(201).json(result);
+      } catch (error) {
+        res.status(500).json({ message: "Failed to add service" });
+      }
     });
 
     app.listen(port, () => {
