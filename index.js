@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { MongoClient, ServerApiVersion } from "mongodb";
+import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -38,6 +38,30 @@ async function run() {
         res.json(services);
       } catch (error) {
         res.status(500).json({ message: "Failed to fetch services" });
+      }
+    });
+
+    // একটা সার্ভিসের ডিটেইলস (পাবলিক)
+    app.get("/services/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ message: "Invalid service ID" });
+        }
+
+        const service = await servicesCollection.findOne({
+          _id: new ObjectId(id),
+          status: "approved",
+        });
+
+        if (!service) {
+          return res.status(404).json({ message: "Service not found" });
+        }
+
+        res.json(service);
+      } catch (error) {
+        res.status(500).json({ message: "Failed to fetch service" });
       }
     });
 
