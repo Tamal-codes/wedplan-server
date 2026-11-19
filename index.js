@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -13,6 +14,8 @@ app.use(
   })
 );
 app.use(express.json());
+
+const JWKS = createRemoteJWKSet(new URL(process.env.JWKS_URL));
 
 const client = new MongoClient(process.env.MONGODB_URI, {
   serverApi: {
@@ -29,8 +32,66 @@ async function run() {
     console.log("MongoDB connected");
 
     const servicesCollection = db.collection("services");
+    const usersCollection = db.collection("user");
 
-   
+    // JWT যাচাই: টোকেন ঠিক কিনা, আর ইউজার ব্লক কিনা
+    const verifyToken = async (req, res, next) => {
+      try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+          return res
+            .status(401)
+            .json({ message: "Unauthorized: token missing" });
+        }
+
+        const token = authHeader.split(" ")[1];
+        const { payload } = await jwtVerify(token, JWKS);
+
+        // টোকেনের রোল বিশ্বাস না করে ডাটাবেস থেকে আসল রোল নেওয়া হচ্ছে
+        const user = await usersCollection.findOne({
+          _id: new ObjectId(payload.id),
+        });
+
+        if (!user) {
+          return res
+            .status(401)
+            .json({ message: "Unauthorized: user not found" });
+        }
+        if (user.isBlocked) {
+          return res
+            .status(403)
+            .json({ message: "Forbidden: account blocked" });
+        }
+
+        req.user = {
+          id: user._id.toString(),
+          email: user.email,
+          name: user.name,
+          role: user.role,
+        };
+        next();
+      } catch (error) {
+        return res
+          .status(401)
+          .json({ message: "Unauthorized: invalid or expired token" });
+      }
+    };
+
+    // রোল যাচাই: শুধু নির্দিষ্ট রোল ঢুকতে পারবে
+    const verifyRole =
+      (...roles) =>
+      (req, res, next) => {
+        if (!req.user || !roles.includes(req.user.role)) {
+          return res.status(403).json({ message: "Forbidden: access denied" });
+        }
+        next();
+      };
+
+    // টেস্ট রুট
+    app.get("/me", verifyToken, (req, res) => {
+      res.json(req.user);
+    });
+
     app.get("/services", async (req, res) => {
       try {
         const { search, category, location, sort } = req.query;
@@ -62,7 +123,6 @@ async function run() {
       }
     });
 
-   
     app.get("/services/:id", async (req, res) => {
       try {
         const { id } = req.params;
