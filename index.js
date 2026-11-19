@@ -34,7 +34,7 @@ async function run() {
     const servicesCollection = db.collection("services");
     const usersCollection = db.collection("user");
 
-    // JWT যাচাই: টোকেন ঠিক কিনা, আর ইউজার ব্লক কিনা
+   
     const verifyToken = async (req, res, next) => {
       try {
         const authHeader = req.headers.authorization;
@@ -47,7 +47,7 @@ async function run() {
         const token = authHeader.split(" ")[1];
         const { payload } = await jwtVerify(token, JWKS);
 
-        // টোকেনের রোল বিশ্বাস না করে ডাটাবেস থেকে আসল রোল নেওয়া হচ্ছে
+     
         const user = await usersCollection.findOne({
           _id: new ObjectId(payload.id),
         });
@@ -77,7 +77,7 @@ async function run() {
       }
     };
 
-    // রোল যাচাই: শুধু নির্দিষ্ট রোল ঢুকতে পারবে
+   
     const verifyRole =
       (...roles) =>
       (req, res, next) => {
@@ -87,7 +87,7 @@ async function run() {
         next();
       };
 
-    // টেস্ট রুট
+   
     app.get("/me", verifyToken, (req, res) => {
       res.json(req.user);
     });
@@ -146,19 +146,78 @@ async function run() {
       }
     });
 
-    app.post("/services", async (req, res) => {
-      try {
-        const service = {
-          ...req.body,
-          status: "pending",
-          createdAt: new Date(),
-        };
-        const result = await servicesCollection.insertOne(service);
-        res.status(201).json(result);
-      } catch (error) {
-        res.status(500).json({ message: "Failed to add service" });
+    app.post(
+      "/services",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const {
+            serviceName,
+            category,
+            description,
+            price,
+            location,
+            images,
+          } = req.body;
+
+          if (
+            !serviceName?.trim() ||
+            !category?.trim() ||
+            !description?.trim() ||
+            !location?.trim() ||
+            !Number.isFinite(Number(price)) ||
+            Number(price) <= 0 ||
+            !Array.isArray(images) ||
+            images.length === 0
+          ) {
+            return res.status(400).json({
+              message: "All fields and at least one image are required",
+            });
+          }
+
+       
+          const vendor = await usersCollection.findOne({
+            _id: new ObjectId(req.user.id),
+          });
+          const isPremium =
+            vendor.subscriptionPlan === "premium" &&
+            vendor.subscriptionExpiresAt &&
+            new Date(vendor.subscriptionExpiresAt) > new Date();
+
+          if (!isPremium) {
+            const activeCount = await servicesCollection.countDocuments({
+              vendorId: req.user.id,
+              status: { $in: ["pending", "approved"] },
+            });
+            if (activeCount >= 3) {
+              return res.status(403).json({
+                message:
+                  "Free plan limit reached (3 services). Upgrade to Premium.",
+              });
+            }
+          }
+
+          const service = {
+            vendorId: req.user.id,
+            vendorName: vendor.businessName || vendor.name,
+            serviceName: serviceName.trim(),
+            category: category.trim(),
+            description: description.trim(),
+            price: Number(price),
+            location: location.trim(),
+            images,
+            status: "pending",
+            createdAt: new Date(),
+          };
+
+          const result = await servicesCollection.insertOne(service);
+          res.status(201).json({ _id: result.insertedId, ...service });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to add service" });
+        }
       }
-    });
+    );
 
     app.listen(port, () => {
       console.log(`Server running on port ${port}`);
