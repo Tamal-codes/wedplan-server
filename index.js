@@ -34,7 +34,7 @@ async function run() {
     const servicesCollection = db.collection("services");
     const usersCollection = db.collection("user");
 
-   
+
     const verifyToken = async (req, res, next) => {
       try {
         const authHeader = req.headers.authorization;
@@ -47,7 +47,7 @@ async function run() {
         const token = authHeader.split(" ")[1];
         const { payload } = await jwtVerify(token, JWKS);
 
-     
+
         const user = await usersCollection.findOne({
           _id: new ObjectId(payload.id),
         });
@@ -77,17 +77,17 @@ async function run() {
       }
     };
 
-   
+
     const verifyRole =
       (...roles) =>
-      (req, res, next) => {
-        if (!req.user || !roles.includes(req.user.role)) {
-          return res.status(403).json({ message: "Forbidden: access denied" });
-        }
-        next();
-      };
+        (req, res, next) => {
+          if (!req.user || !roles.includes(req.user.role)) {
+            return res.status(403).json({ message: "Forbidden: access denied" });
+          }
+          next();
+        };
 
-   
+
     app.get("/me", verifyToken, (req, res) => {
       res.json(req.user);
     });
@@ -176,7 +176,7 @@ async function run() {
             });
           }
 
-       
+
           const vendor = await usersCollection.findOne({
             _id: new ObjectId(req.user.id),
           });
@@ -215,6 +215,24 @@ async function run() {
           res.status(201).json({ _id: result.insertedId, ...service });
         } catch (error) {
           res.status(500).json({ message: "Failed to add service" });
+        }
+      }
+    );
+
+
+    app.get(
+      "/vendor/services",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const services = await servicesCollection
+            .find({ vendorId: req.user.id })
+            .sort({ createdAt: -1 })
+            .toArray();
+          res.json(services);
+        } catch (error) {
+          res.status(500).json({ message: "Failed to fetch your services" });
         }
       }
     );
