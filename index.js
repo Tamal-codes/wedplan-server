@@ -33,8 +33,9 @@ async function run() {
 
     const servicesCollection = db.collection("services");
     const usersCollection = db.collection("user");
+    const bookingsCollection = db.collection("bookings");
 
-
+    // JWT যাচাই: টোকেন ঠিক কিনা, আর ইউজার ব্লক কিনা
     const verifyToken = async (req, res, next) => {
       try {
         const authHeader = req.headers.authorization;
@@ -47,7 +48,7 @@ async function run() {
         const token = authHeader.split(" ")[1];
         const { payload } = await jwtVerify(token, JWKS);
 
-
+        // টোকেনের রোল বিশ্বাস না করে ডাটাবেস থেকে আসল রোল নেওয়া হচ্ছে
         const user = await usersCollection.findOne({
           _id: new ObjectId(payload.id),
         });
@@ -77,15 +78,15 @@ async function run() {
       }
     };
 
-
+    // রোল যাচাই: শুধু নির্দিষ্ট রোল ঢুকতে পারবে
     const verifyRole =
       (...roles) =>
-        (req, res, next) => {
-          if (!req.user || !roles.includes(req.user.role)) {
-            return res.status(403).json({ message: "Forbidden: access denied" });
-          }
-          next();
-        };
+      (req, res, next) => {
+        if (!req.user || !roles.includes(req.user.role)) {
+          return res.status(403).json({ message: "Forbidden: access denied" });
+        }
+        next();
+      };
 
     app.get("/me", verifyToken, (req, res) => {
       res.json(req.user);
@@ -146,7 +147,6 @@ async function run() {
       }
     });
 
-
     app.post(
       "/services",
       verifyToken,
@@ -176,7 +176,6 @@ async function run() {
               message: "All fields and at least one image are required",
             });
           }
-
 
           const vendor = await usersCollection.findOne({
             _id: new ObjectId(req.user.id),
@@ -220,7 +219,6 @@ async function run() {
       }
     );
 
-
     app.get(
       "/vendor/services",
       verifyToken,
@@ -237,7 +235,6 @@ async function run() {
         }
       }
     );
-
 
     // ভেন্ডরের নিজের একটা সার্ভিস (যেকোনো স্ট্যাটাস)
     app.get(
@@ -337,7 +334,6 @@ async function run() {
       }
     );
 
-
     app.patch(
       "/services/:id/availability",
       verifyToken,
@@ -377,7 +373,6 @@ async function run() {
       }
     );
 
-
     app.delete(
       "/services/:id",
       verifyToken,
@@ -405,6 +400,258 @@ async function run() {
           res.json({ message: "Service deleted" });
         } catch (error) {
           res.status(500).json({ message: "Failed to delete service" });
+        }
+      }
+    );
+
+    // বুকিং রিকোয়েস্ট পাঠানো (শুধু customer)
+    app.post(
+      "/bookings",
+      verifyToken,
+      verifyRole("customer"),
+      async (req, res) => {
+        try {
+          const { serviceId, eventDate, eventLocation, message } = req.body;
+
+          if (!ObjectId.isValid(serviceId)) {
+            return res.status(400).json({ message: "Invalid service ID" });
+          }
+          if (!eventLocation?.trim() || !eventDate) {
+            return res
+              .status(400)
+              .json({ message: "Event date and location are required" });
+          }
+
+          const date = new Date(eventDate);
+          if (isNaN(date.getTime())) {
+            return res.status(400).json({ message: "Invalid event date" });
+          }
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+          if (date < today) {
+            return res
+              .status(400)
+              .json({ message: "Event date cannot be in the past" });
+          }
+
+          const service = await servicesCollection.findOne({
+            _id: new ObjectId(serviceId),
+            status: "approved",
+            isAvailable: { $ne: false },
+          });
+          if (!service) {
+            return res
+              .status(404)
+              .json({ message: "Service not found or unavailable" });
+          }
+          if (service.vendorId === req.user.id) {
+            return res
+              .status(403)
+              .json({ message: "You cannot book your own service" });
+          }
+
+          // একই সার্ভিস ও তারিখে ডুপ্লিকেট active রিকোয়েস্ট আটকানো
+          const duplicate = await bookingsCollection.findOne({
+            serviceId,
+            customerId: req.user.id,
+            eventDate: date.toISOString().slice(0, 10),
+            status: { $in: ["pending", "accepted"] },
+          });
+          if (duplicate) {
+            return res.status(409).json({
+              message: "You already have an active request for this date",
+            });
+          }
+
+          const booking = {
+            serviceId,
+            vendorId: service.vendorId,
+            customerId: req.user.id,
+            eventDate: date.toISOString().slice(0, 10),
+            eventLocation: eventLocation.trim(),
+            message: (message ?? "").trim(),
+            status: "pending",
+            createdAt: new Date(),
+          };
+          const result = await bookingsCollection.insertOne(booking);
+          res.status(201).json({ _id: result.insertedId, ...booking });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to submit booking" });
+        }
+      }
+    );
+
+    // কাস্টমারের নিজের বুকিং (সার্ভিসের তথ্যসহ)
+    app.get(
+      "/customer/bookings",
+      verifyToken,
+      verifyRole("customer"),
+      async (req, res) => {
+        try {
+          const bookings = await bookingsCollection
+            .aggregate([
+              { $match: { customerId: req.user.id } },
+              { $sort: { createdAt: -1 } },
+              {
+                $addFields: { serviceObjId: { $toObjectId: "$serviceId" } },
+              },
+              {
+                $lookup: {
+                  from: "services",
+                  localField: "serviceObjId",
+                  foreignField: "_id",
+                  as: "service",
+                },
+              },
+              {
+                $unwind: { path: "$service", preserveNullAndEmptyArrays: true },
+              },
+              { $project: { serviceObjId: 0 } },
+            ])
+            .toArray();
+          res.json(bookings);
+        } catch (error) {
+          res.status(500).json({ message: "Failed to fetch bookings" });
+        }
+      }
+    );
+
+    // কাস্টমার pending বুকিং বাতিল করবে
+    app.patch(
+      "/bookings/:id/cancel",
+      verifyToken,
+      verifyRole("customer"),
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid booking ID" });
+          }
+          const booking = await bookingsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!booking) {
+            return res.status(404).json({ message: "Booking not found" });
+          }
+          if (booking.customerId !== req.user.id) {
+            return res
+              .status(403)
+              .json({ message: "Forbidden: not your booking" });
+          }
+          if (booking.status !== "pending") {
+            return res
+              .status(400)
+              .json({ message: "Only pending bookings can be cancelled" });
+          }
+          await bookingsCollection.updateOne(
+            { _id: new ObjectId(id), status: "pending" },
+            { $set: { status: "cancelled" } }
+          );
+          res.json({ message: "Booking cancelled" });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to cancel booking" });
+        }
+      }
+    );
+
+    // ভেন্ডরের সার্ভিসের সব বুকিং (কাস্টমার ও সার্ভিসের তথ্যসহ)
+    app.get(
+      "/vendor/bookings",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const bookings = await bookingsCollection
+            .aggregate([
+              { $match: { vendorId: req.user.id } },
+              { $sort: { createdAt: -1 } },
+              {
+                $addFields: {
+                  serviceObjId: { $toObjectId: "$serviceId" },
+                  customerObjId: { $toObjectId: "$customerId" },
+                },
+              },
+              {
+                $lookup: {
+                  from: "services",
+                  localField: "serviceObjId",
+                  foreignField: "_id",
+                  as: "service",
+                },
+              },
+              {
+                $lookup: {
+                  from: "user",
+                  localField: "customerObjId",
+                  foreignField: "_id",
+                  as: "customer",
+                },
+              },
+              {
+                $unwind: { path: "$service", preserveNullAndEmptyArrays: true },
+              },
+              {
+                $unwind: {
+                  path: "$customer",
+                  preserveNullAndEmptyArrays: true,
+                },
+              },
+              {
+                $project: {
+                  serviceObjId: 0,
+                  customerObjId: 0,
+                  "customer.password": 0,
+                },
+              },
+            ])
+            .toArray();
+          res.json(bookings);
+        } catch (error) {
+          res.status(500).json({ message: "Failed to fetch bookings" });
+        }
+      }
+    );
+
+    // ভেন্ডর accept/reject (শুধু pending, শুধু নিজের সার্ভিসের)
+    app.patch(
+      "/bookings/:id/status",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const { status } = req.body;
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid booking ID" });
+          }
+          if (!["accepted", "rejected"].includes(status)) {
+            return res
+              .status(400)
+              .json({ message: "Status must be accepted or rejected" });
+          }
+          const booking = await bookingsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!booking) {
+            return res.status(404).json({ message: "Booking not found" });
+          }
+          if (booking.vendorId !== req.user.id) {
+            return res
+              .status(403)
+              .json({ message: "Forbidden: not your booking" });
+          }
+          if (booking.status !== "pending") {
+            return res
+              .status(400)
+              .json({ message: "Only pending requests can be processed" });
+          }
+          await bookingsCollection.updateOne(
+            { _id: new ObjectId(id), status: "pending" },
+            { $set: { status } }
+          );
+          res.json({ message: `Booking ${status}` });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to update booking" });
         }
       }
     );
