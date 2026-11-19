@@ -34,7 +34,7 @@ async function run() {
     const servicesCollection = db.collection("services");
     const usersCollection = db.collection("user");
 
-    // JWT যাচাই: টোকেন ঠিক কিনা, আর ইউজার ব্লক কিনা
+
     const verifyToken = async (req, res, next) => {
       try {
         const authHeader = req.headers.authorization;
@@ -47,7 +47,7 @@ async function run() {
         const token = authHeader.split(" ")[1];
         const { payload } = await jwtVerify(token, JWKS);
 
-        // টোকেনের রোল বিশ্বাস না করে ডাটাবেস থেকে আসল রোল নেওয়া হচ্ছে
+
         const user = await usersCollection.findOne({
           _id: new ObjectId(payload.id),
         });
@@ -77,17 +77,16 @@ async function run() {
       }
     };
 
-    // রোল যাচাই: শুধু নির্দিষ্ট রোল ঢুকতে পারবে
+
     const verifyRole =
       (...roles) =>
-      (req, res, next) => {
-        if (!req.user || !roles.includes(req.user.role)) {
-          return res.status(403).json({ message: "Forbidden: access denied" });
-        }
-        next();
-      };
+        (req, res, next) => {
+          if (!req.user || !roles.includes(req.user.role)) {
+            return res.status(403).json({ message: "Forbidden: access denied" });
+          }
+          next();
+        };
 
-    // টেস্ট রুট
     app.get("/me", verifyToken, (req, res) => {
       res.json(req.user);
     });
@@ -147,7 +146,7 @@ async function run() {
       }
     });
 
-    // সার্ভিস যোগ (শুধু vendor)
+
     app.post(
       "/services",
       verifyToken,
@@ -178,7 +177,7 @@ async function run() {
             });
           }
 
-          // ফ্রি প্ল্যানে সর্বোচ্চ ৩টা active সার্ভিস
+
           const vendor = await usersCollection.findOne({
             _id: new ObjectId(req.user.id),
           });
@@ -221,7 +220,7 @@ async function run() {
       }
     );
 
-    // ভেন্ডরের নিজের সব সার্ভিস (যেকোনো স্ট্যাটাস)
+
     app.get(
       "/vendor/services",
       verifyToken,
@@ -239,7 +238,32 @@ async function run() {
       }
     );
 
-    // সার্ভিস আপডেট (শুধু নিজের সার্ভিস)
+
+    // ভেন্ডরের নিজের একটা সার্ভিস (যেকোনো স্ট্যাটাস)
+    app.get(
+      "/vendor/services/:id",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid service ID" });
+          }
+          const service = await servicesCollection.findOne({
+            _id: new ObjectId(id),
+            vendorId: req.user.id,
+          });
+          if (!service) {
+            return res.status(404).json({ message: "Service not found" });
+          }
+          res.json(service);
+        } catch (error) {
+          res.status(500).json({ message: "Failed to fetch service" });
+        }
+      }
+    );
+
     app.patch(
       "/services/:id",
       verifyToken,
@@ -313,7 +337,7 @@ async function run() {
       }
     );
 
-    // availability চালু/বন্ধ (শুধু নিজের সার্ভিস)
+
     app.patch(
       "/services/:id/availability",
       verifyToken,
@@ -353,7 +377,7 @@ async function run() {
       }
     );
 
-    // সার্ভিস ডিলিট (শুধু নিজের সার্ভিস)
+
     app.delete(
       "/services/:id",
       verifyToken,
