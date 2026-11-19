@@ -34,7 +34,7 @@ async function run() {
     const servicesCollection = db.collection("services");
     const usersCollection = db.collection("user");
 
-
+    // JWT যাচাই: টোকেন ঠিক কিনা, আর ইউজার ব্লক কিনা
     const verifyToken = async (req, res, next) => {
       try {
         const authHeader = req.headers.authorization;
@@ -47,7 +47,7 @@ async function run() {
         const token = authHeader.split(" ")[1];
         const { payload } = await jwtVerify(token, JWKS);
 
-
+        // টোকেনের রোল বিশ্বাস না করে ডাটাবেস থেকে আসল রোল নেওয়া হচ্ছে
         const user = await usersCollection.findOne({
           _id: new ObjectId(payload.id),
         });
@@ -77,17 +77,17 @@ async function run() {
       }
     };
 
-
+    // রোল যাচাই: শুধু নির্দিষ্ট রোল ঢুকতে পারবে
     const verifyRole =
       (...roles) =>
-        (req, res, next) => {
-          if (!req.user || !roles.includes(req.user.role)) {
-            return res.status(403).json({ message: "Forbidden: access denied" });
-          }
-          next();
-        };
+      (req, res, next) => {
+        if (!req.user || !roles.includes(req.user.role)) {
+          return res.status(403).json({ message: "Forbidden: access denied" });
+        }
+        next();
+      };
 
-
+    // টেস্ট রুট
     app.get("/me", verifyToken, (req, res) => {
       res.json(req.user);
     });
@@ -96,7 +96,7 @@ async function run() {
       try {
         const { search, category, location, sort } = req.query;
 
-        const query = { status: "approved" };
+        const query = { status: "approved", isAvailable: { $ne: false } };
 
         if (search) {
           query.serviceName = { $regex: search, $options: "i" };
@@ -134,6 +134,7 @@ async function run() {
         const service = await servicesCollection.findOne({
           _id: new ObjectId(id),
           status: "approved",
+          isAvailable: { $ne: false },
         });
 
         if (!service) {
@@ -146,6 +147,7 @@ async function run() {
       }
     });
 
+    // সার্ভিস যোগ (শুধু vendor)
     app.post(
       "/services",
       verifyToken,
@@ -176,7 +178,7 @@ async function run() {
             });
           }
 
-
+          // ফ্রি প্ল্যানে সর্বোচ্চ ৩টা active সার্ভিস
           const vendor = await usersCollection.findOne({
             _id: new ObjectId(req.user.id),
           });
@@ -219,7 +221,7 @@ async function run() {
       }
     );
 
-
+    // ভেন্ডরের নিজের সব সার্ভিস (যেকোনো স্ট্যাটাস)
     app.get(
       "/vendor/services",
       verifyToken,
@@ -233,6 +235,152 @@ async function run() {
           res.json(services);
         } catch (error) {
           res.status(500).json({ message: "Failed to fetch your services" });
+        }
+      }
+    );
+
+    // সার্ভিস আপডেট (শুধু নিজের সার্ভিস)
+    app.patch(
+      "/services/:id",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid service ID" });
+          }
+
+          const service = await servicesCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!service) {
+            return res.status(404).json({ message: "Service not found" });
+          }
+          if (service.vendorId !== req.user.id) {
+            return res
+              .status(403)
+              .json({ message: "Forbidden: not your service" });
+          }
+
+          const {
+            serviceName,
+            category,
+            description,
+            price,
+            location,
+            images,
+          } = req.body;
+          const updates = {};
+
+          if (serviceName !== undefined) {
+            if (!serviceName.trim()) {
+              return res.status(400).json({ message: "Invalid service name" });
+            }
+            updates.serviceName = serviceName.trim();
+          }
+          if (category !== undefined) updates.category = category.trim();
+          if (description !== undefined)
+            updates.description = description.trim();
+          if (location !== undefined) updates.location = location.trim();
+          if (price !== undefined) {
+            if (!Number.isFinite(Number(price)) || Number(price) <= 0) {
+              return res.status(400).json({ message: "Invalid price" });
+            }
+            updates.price = Number(price);
+          }
+          if (images !== undefined) {
+            if (!Array.isArray(images) || images.length === 0) {
+              return res
+                .status(400)
+                .json({ message: "At least one image is required" });
+            }
+            updates.images = images;
+          }
+
+          if (Object.keys(updates).length === 0) {
+            return res.status(400).json({ message: "Nothing to update" });
+          }
+
+          await servicesCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: updates }
+          );
+          res.json({ message: "Service updated" });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to update service" });
+        }
+      }
+    );
+
+    // availability চালু/বন্ধ (শুধু নিজের সার্ভিস)
+    app.patch(
+      "/services/:id/availability",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid service ID" });
+          }
+          if (typeof req.body.isAvailable !== "boolean") {
+            return res
+              .status(400)
+              .json({ message: "isAvailable must be true or false" });
+          }
+
+          const service = await servicesCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!service) {
+            return res.status(404).json({ message: "Service not found" });
+          }
+          if (service.vendorId !== req.user.id) {
+            return res
+              .status(403)
+              .json({ message: "Forbidden: not your service" });
+          }
+
+          await servicesCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { isAvailable: req.body.isAvailable } }
+          );
+          res.json({ message: "Availability updated" });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to update availability" });
+        }
+      }
+    );
+
+    // সার্ভিস ডিলিট (শুধু নিজের সার্ভিস)
+    app.delete(
+      "/services/:id",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid service ID" });
+          }
+
+          const service = await servicesCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!service) {
+            return res.status(404).json({ message: "Service not found" });
+          }
+          if (service.vendorId !== req.user.id) {
+            return res
+              .status(403)
+              .json({ message: "Forbidden: not your service" });
+          }
+
+          await servicesCollection.deleteOne({ _id: new ObjectId(id) });
+          res.json({ message: "Service deleted" });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to delete service" });
         }
       }
     );
