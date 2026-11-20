@@ -34,6 +34,7 @@ async function run() {
     const servicesCollection = db.collection("services");
     const usersCollection = db.collection("user");
     const bookingsCollection = db.collection("bookings");
+    const transactionsCollection = db.collection("transactions");
 
     // JWT যাচাই: টোকেন ঠিক কিনা, আর ইউজার ব্লক কিনা
     const verifyToken = async (req, res, next) => {
@@ -652,6 +653,248 @@ async function run() {
           res.json({ message: `Booking ${status}` });
         } catch (error) {
           res.status(500).json({ message: "Failed to update booking" });
+        }
+      }
+    );
+
+    // ================= ADMIN APIs =================
+
+    // ড্যাশবোর্ড পরিসংখ্যান
+    app.get(
+      "/admin/stats",
+      verifyToken,
+      verifyRole("admin"),
+      async (req, res) => {
+        try {
+          const [
+            totalUsers,
+            totalVendors,
+            totalCustomers,
+            totalServices,
+            pendingServices,
+            totalTransactions,
+          ] = await Promise.all([
+            usersCollection.countDocuments(),
+            usersCollection.countDocuments({ role: "vendor" }),
+            usersCollection.countDocuments({ role: "customer" }),
+            servicesCollection.countDocuments(),
+            servicesCollection.countDocuments({ status: "pending" }),
+            transactionsCollection.countDocuments(),
+          ]);
+          res.json({
+            totalUsers,
+            totalVendors,
+            totalCustomers,
+            totalServices,
+            pendingServices,
+            totalTransactions,
+          });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to fetch stats" });
+        }
+      }
+    );
+
+    // সব ইউজার (সার্চ ও রোল ফিল্টার সহ)
+    app.get(
+      "/admin/users",
+      verifyToken,
+      verifyRole("admin"),
+      async (req, res) => {
+        try {
+          const { search, role } = req.query;
+          const query = {};
+
+          if (search) {
+            query.$or = [
+              { name: { $regex: search, $options: "i" } },
+              { email: { $regex: search, $options: "i" } },
+            ];
+          }
+          if (role && ["admin", "vendor", "customer"].includes(role)) {
+            query.role = role;
+          }
+
+          const users = await usersCollection
+            .find(query)
+            .project({ password: 0 })
+            .sort({ createdAt: -1 })
+            .toArray();
+          res.json(users);
+        } catch (error) {
+          res.status(500).json({ message: "Failed to fetch users" });
+        }
+      }
+    );
+
+    // ইউজার ব্লক/আনব্লক
+    app.patch(
+      "/admin/users/:id/block",
+      verifyToken,
+      verifyRole("admin"),
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const { isBlocked } = req.body;
+
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid user ID" });
+          }
+          if (typeof isBlocked !== "boolean") {
+            return res
+              .status(400)
+              .json({ message: "isBlocked must be true or false" });
+          }
+          if (id === req.user.id) {
+            return res
+              .status(400)
+              .json({ message: "You cannot block yourself" });
+          }
+
+          const target = await usersCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!target) {
+            return res.status(404).json({ message: "User not found" });
+          }
+          if (target.role === "admin") {
+            return res
+              .status(403)
+              .json({ message: "Admin accounts cannot be blocked" });
+          }
+
+          await usersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { isBlocked } }
+          );
+          res.json({ message: isBlocked ? "User blocked" : "User unblocked" });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to update user" });
+        }
+      }
+    );
+
+    // সব সার্ভিস (যেকোনো স্ট্যাটাস, সার্চ ও ফিল্টার সহ)
+    app.get(
+      "/admin/services",
+      verifyToken,
+      verifyRole("admin"),
+      async (req, res) => {
+        try {
+          const { search, status, category } = req.query;
+          const query = {};
+
+          if (search) {
+            query.serviceName = { $regex: search, $options: "i" };
+          }
+          if (status && ["pending", "approved", "rejected"].includes(status)) {
+            query.status = status;
+          }
+          if (category) {
+            query.category = category;
+          }
+
+          const services = await servicesCollection
+            .find(query)
+            .sort({ createdAt: -1 })
+            .toArray();
+          res.json(services);
+        } catch (error) {
+          res.status(500).json({ message: "Failed to fetch services" });
+        }
+      }
+    );
+
+    // সার্ভিস approve/reject/pending
+    app.patch(
+      "/admin/services/:id/status",
+      verifyToken,
+      verifyRole("admin"),
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const { status } = req.body;
+
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid service ID" });
+          }
+          if (!["pending", "approved", "rejected"].includes(status)) {
+            return res.status(400).json({ message: "Invalid status" });
+          }
+
+          const result = await servicesCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { status } }
+          );
+          if (result.matchedCount === 0) {
+            return res.status(404).json({ message: "Service not found" });
+          }
+          res.json({ message: `Service ${status}` });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to update service" });
+        }
+      }
+    );
+
+    // অনুপযুক্ত সার্ভিস ডিলিট
+    app.delete(
+      "/admin/services/:id",
+      verifyToken,
+      verifyRole("admin"),
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: "Invalid service ID" });
+          }
+          const result = await servicesCollection.deleteOne({
+            _id: new ObjectId(id),
+          });
+          if (result.deletedCount === 0) {
+            return res.status(404).json({ message: "Service not found" });
+          }
+          res.json({ message: "Service deleted" });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to delete service" });
+        }
+      }
+    );
+
+    // ট্রানজ্যাকশন (শুধু দেখা যাবে, বদলানো যাবে না)
+    app.get(
+      "/admin/transactions",
+      verifyToken,
+      verifyRole("admin"),
+      async (req, res) => {
+        try {
+          const transactions = await transactionsCollection
+            .aggregate([
+              { $sort: { createdAt: -1 } },
+              {
+                $addFields: { vendorObjId: { $toObjectId: "$vendorId" } },
+              },
+              {
+                $lookup: {
+                  from: "user",
+                  localField: "vendorObjId",
+                  foreignField: "_id",
+                  as: "vendor",
+                },
+              },
+              {
+                $unwind: { path: "$vendor", preserveNullAndEmptyArrays: true },
+              },
+              {
+                $project: {
+                  vendorObjId: 0,
+                  "vendor.password": 0,
+                },
+              },
+            ])
+            .toArray();
+          res.json(transactions);
+        } catch (error) {
+          res.status(500).json({ message: "Failed to fetch transactions" });
         }
       }
     );
