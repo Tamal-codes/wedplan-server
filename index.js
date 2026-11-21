@@ -3,8 +3,10 @@ import express from "express";
 import cors from "cors";
 import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import Stripe from "stripe";
 
 const app = express();
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const port = process.env.PORT || 5000;
 
 app.use(
@@ -13,7 +15,12 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json());
+
+// ওয়েবহুকের জন্য raw body লাগে, তাই ওই রুটে json পার্সার চলবে না
+app.use((req, res, next) => {
+  if (req.originalUrl === "/webhook") return next();
+  express.json()(req, res, next);
+});
 
 const JWKS = createRemoteJWKSet(new URL(process.env.JWKS_URL));
 
@@ -895,6 +902,239 @@ async function run() {
           res.json(transactions);
         } catch (error) {
           res.status(500).json({ message: "Failed to fetch transactions" });
+        }
+      }
+    );
+
+    // ================= PAYMENT (Stripe) =================
+
+    // Premium কেনার Checkout Session (শুধু নিজের জন্য)
+    app.post(
+      "/subscription/checkout",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const vendor = await usersCollection.findOne({
+            _id: new ObjectId(req.user.id),
+          });
+          const active =
+            vendor.subscriptionPlan === "premium" &&
+            vendor.subscriptionExpiresAt &&
+            new Date(vendor.subscriptionExpiresAt) > new Date();
+          if (active) {
+            return res
+              .status(400)
+              .json({ message: "You already have an active Premium plan" });
+          }
+
+          const session = await stripe.checkout.sessions.create({
+            mode: "payment",
+            customer_email: vendor.email,
+            line_items: [
+              {
+                quantity: 1,
+                price_data: {
+                  currency: "usd",
+                  unit_amount: 2000,
+                  product_data: { name: "WedPlan Premium (30 days)" },
+                },
+              },
+            ],
+            // vendorId টোকেন থেকে আসে, ক্লায়েন্টের পাঠানো আইডি নয়
+            metadata: { vendorId: req.user.id },
+            success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+          });
+
+          await transactionsCollection.insertOne({
+            vendorId: req.user.id,
+            plan: "premium",
+            amount: 2000,
+            currency: "usd",
+            stripeSessionId: session.id,
+            stripeSubscriptionId: null,
+            status: "pending",
+            createdAt: new Date(),
+          });
+
+          res.json({ url: session.url });
+        } catch (error) {
+          console.error("Checkout error:", error.message);
+          res.status(500).json({ message: "Failed to start checkout" });
+        }
+      }
+    );
+
+    // সাবস্ক্রিপশনের বর্তমান অবস্থা (মেয়াদ শেষ হলে Free করে দেয়)
+    app.get(
+      "/subscription/status",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const vendor = await usersCollection.findOne({
+            _id: new ObjectId(req.user.id),
+          });
+          const active =
+            vendor.subscriptionPlan === "premium" &&
+            vendor.subscriptionExpiresAt &&
+            new Date(vendor.subscriptionExpiresAt) > new Date();
+
+          if (vendor.subscriptionPlan === "premium" && !active) {
+            await usersCollection.updateOne(
+              { _id: vendor._id },
+              { $set: { subscriptionPlan: "free" } }
+            );
+          }
+
+          res.json({
+            plan: active ? "premium" : "free",
+            expiresAt: active ? vendor.subscriptionExpiresAt : null,
+          });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to fetch subscription" });
+        }
+      }
+    );
+
+    // Stripe ওয়েবহুক: এখানেই শুধু Premium চালু হয়
+    app.post(
+      "/webhook",
+      express.raw({ type: "application/json" }),
+      async (req, res) => {
+        let event;
+        try {
+          event = stripe.webhooks.constructEvent(
+            req.body,
+            req.headers["stripe-signature"],
+            process.env.STRIPE_WEBHOOK_SECRET
+          );
+        } catch (error) {
+          return res.status(400).send("Webhook signature verification failed");
+        }
+
+        try {
+          if (event.type === "checkout.session.completed") {
+            const session = event.data.object;
+
+            if (session.payment_status === "paid") {
+              // একই ইভেন্ট দুইবার এলেও একবারই কাজ হবে
+              const result = await transactionsCollection.updateOne(
+                { stripeSessionId: session.id, status: { $ne: "paid" } },
+                {
+                  $set: {
+                    status: "paid",
+                    amount: session.amount_total,
+                    currency: session.currency,
+                    paidAt: new Date(),
+                  },
+                }
+              );
+
+              if (result.matchedCount === 1) {
+                const vendorId = session.metadata?.vendorId;
+                const vendor = await usersCollection.findOne({
+                  _id: new ObjectId(vendorId),
+                });
+                if (vendor) {
+                  const now = new Date();
+                  const base =
+                    vendor.subscriptionExpiresAt &&
+                    new Date(vendor.subscriptionExpiresAt) > now
+                      ? new Date(vendor.subscriptionExpiresAt)
+                      : now;
+                  const expires = new Date(
+                    base.getTime() + 30 * 24 * 60 * 60 * 1000
+                  );
+                  await usersCollection.updateOne(
+                    { _id: vendor._id },
+                    {
+                      $set: {
+                        subscriptionPlan: "premium",
+                        subscriptionExpiresAt: expires,
+                      },
+                    }
+                  );
+                }
+              }
+            }
+          }
+
+          if (event.type === "checkout.session.expired") {
+            await transactionsCollection.updateOne(
+              { stripeSessionId: event.data.object.id, status: "pending" },
+              { $set: { status: "failed" } }
+            );
+          }
+
+          res.json({ received: true });
+        } catch (error) {
+          res.status(500).send("Webhook handler failed");
+        }
+      }
+    );
+
+    // পেমেন্টের পর Stripe থেকে সরাসরি যাচাই করে Premium চালু
+    app.post(
+      "/subscription/confirm",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const { sessionId } = req.body;
+          if (!sessionId || typeof sessionId !== "string") {
+            return res.status(400).json({ message: "Session ID required" });
+          }
+
+          const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+          if (session.metadata?.vendorId !== req.user.id) {
+            return res.status(403).json({ message: "Forbidden" });
+          }
+          if (session.payment_status !== "paid") {
+            return res.status(400).json({ message: "Payment not completed" });
+          }
+
+          const result = await transactionsCollection.updateOne(
+            { stripeSessionId: session.id, status: { $ne: "paid" } },
+            {
+              $set: {
+                status: "paid",
+                amount: session.amount_total,
+                currency: session.currency,
+                paidAt: new Date(),
+              },
+            }
+          );
+
+          if (result.matchedCount === 1) {
+            const vendor = await usersCollection.findOne({
+              _id: new ObjectId(req.user.id),
+            });
+            const now = new Date();
+            const base =
+              vendor.subscriptionExpiresAt &&
+              new Date(vendor.subscriptionExpiresAt) > now
+                ? new Date(vendor.subscriptionExpiresAt)
+                : now;
+            await usersCollection.updateOne(
+              { _id: vendor._id },
+              {
+                $set: {
+                  subscriptionPlan: "premium",
+                  subscriptionExpiresAt: new Date(
+                    base.getTime() + 30 * 24 * 60 * 60 * 1000
+                  ),
+                },
+              }
+            );
+          }
+
+          res.json({ message: "Premium activated" });
+        } catch (error) {
+          console.error("Confirm error:", error.message);
+          res.status(500).json({ message: "Failed to confirm payment" });
         }
       }
     );
