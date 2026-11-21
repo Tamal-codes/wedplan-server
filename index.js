@@ -1139,6 +1139,75 @@ async function run() {
       }
     );
 
+    // নিজের প্রোফাইল আপডেট (রোল, প্ল্যান, isBlocked বদলানো যাবে না)
+    app.patch(
+      "/profile",
+      verifyToken,
+      verifyRole("vendor", "customer"),
+      async (req, res) => {
+        try {
+          const { name, image, businessName } = req.body;
+          const updates = {};
+
+          if (name !== undefined) {
+            if (typeof name !== "string" || !name.trim()) {
+              return res.status(400).json({ message: "Name is required" });
+            }
+            updates.name = name.trim();
+          }
+          if (image !== undefined) {
+            if (typeof image !== "string") {
+              return res.status(400).json({ message: "Invalid image" });
+            }
+            updates.image = image;
+          }
+          if (businessName !== undefined && req.user.role === "vendor") {
+            if (typeof businessName !== "string") {
+              return res.status(400).json({ message: "Invalid business name" });
+            }
+            updates.businessName = businessName.trim();
+          }
+
+          if (Object.keys(updates).length === 0) {
+            return res.status(400).json({ message: "Nothing to update" });
+          }
+
+          updates.updatedAt = new Date();
+          await usersCollection.updateOne(
+            { _id: new ObjectId(req.user.id) },
+            { $set: updates }
+          );
+          res.json({ message: "Profile updated" });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to update profile" });
+        }
+      }
+    );
+
+    // ভেন্ডরের বুকিং পরিসংখ্যান
+    app.get(
+      "/vendor/stats",
+      verifyToken,
+      verifyRole("vendor"),
+      async (req, res) => {
+        try {
+          const [pending, accepted] = await Promise.all([
+            bookingsCollection.countDocuments({
+              vendorId: req.user.id,
+              status: "pending",
+            }),
+            bookingsCollection.countDocuments({
+              vendorId: req.user.id,
+              status: "accepted",
+            }),
+          ]);
+          res.json({ pendingBookings: pending, acceptedBookings: accepted });
+        } catch (error) {
+          res.status(500).json({ message: "Failed to fetch stats" });
+        }
+      }
+    );
+
     app.listen(port, () => {
       console.log(`Server running on port ${port}`);
     });
